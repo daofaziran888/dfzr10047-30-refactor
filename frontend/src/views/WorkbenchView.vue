@@ -60,6 +60,15 @@
             >
               {{ action }}
             </button>
+            <button
+              v-if="meta.key === 'parse_metric'"
+              class="link"
+              type="button"
+              :data-testid="`evidence-${row.id}`"
+              @click="openEvidence(row)"
+            >
+              事实核对
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -86,6 +95,12 @@
       </form>
     </div>
 
+    <SettlementEvidencePanel
+      :visible="evidenceVisible"
+      :row="evidenceRow"
+      @close="evidenceVisible = false"
+    />
+
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -104,6 +119,7 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import SettlementEvidencePanel from './SettlementEvidencePanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -115,6 +131,13 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const evidenceVisible = ref(false)
+const evidenceRow = ref<EntryRow | null>(null)
+
+function openEvidence(row: EntryRow) {
+  evidenceRow.value = row
+  evidenceVisible.value = true
+}
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },

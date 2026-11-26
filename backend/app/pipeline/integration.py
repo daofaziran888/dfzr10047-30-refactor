@@ -139,6 +139,8 @@ class ParsePipelineOrchestrator:
             "解析器标识": decision.selected_parser if decision else "",
             "总行数": str(total_rows), "成功行数": str(success_rows),
             "隔离行数": str(quarantined), "批次状态": batch_status,
+            # 无隔离直接闭合时同步签发闭合凭据，供指标事实来源核对
+            "闭合凭据": f"CC-{batch_id}" if quarantined == 0 else "",
             "完成时间": deliver_time,
         }, status=batch_status, pending=quarantined > 0, abnormal=quarantined > 0)
 
@@ -243,6 +245,9 @@ class ParsePipelineOrchestrator:
                 if int(row["隔离行数"]) == 0:
                     row["批次状态"] = "已闭合"
                     row["status"] = "已闭合"
+                    # 回补闭合签发与服务层一致的稳定凭据，事实来源只认一笔
+                    row["闭合凭据"] = str(row.get("闭合凭据") or "").strip() or (
+                        f"CC-{batch_id}")
                     row["pending"] = False
                     row["abnormal"] = False
                 break
@@ -579,36 +584,92 @@ class ParsePipelineOrchestrator:
 
     # ------------------------------------------------------------------
     # 链路9：解析指标结算(隔离率/回退率来自真实计数)
+    #
+    # 重构后管线结算与手工结算共用 app.facts 的已闭合批次事实来源：
+    # 管线先发布完成证明（闭合凭据），再由解析指标服务读同一事实重算读数，
+    # 同一读数的吞吐、隔离分子/分母、回退分子/分母来自同一组闭合批次。
     # ------------------------------------------------------------------
     def link9_metric_settle(
         self, reading_id: str, window: str, channel: str, batch_id: str,
         total_rows: int, parse_durations_ms: list[float], collected_at: str,
     ) -> dict[str, Any]:
         link = "metric-settle"
-        quarantined_rows = len(self.quarantine.get_quarantined(batch_id))
-        quarantine_rate = quarantined_rows / total_rows if total_rows > 0 else 0.0
-        fallback_decisions, total_decisions = self.route.fallback_stats()
-        reading = self.review.collect_metric(
-            reading_id, window, channel, total_rows, parse_durations_ms,
-            quarantined_rows, total_rows, fallback_decisions, total_decisions,
-            collected_at)
-        _append_row("parse_metric", {
-            "指标读数编号": reading_id, "统计窗口": window, "来源渠道": channel,
-            "解析吞吐行数": str(total_rows),
-            "平均解析耗时": f"{reading.avg_parse_ms:.2f}",
-            "隔离率": f"{reading.quarantine_rate:.4f}",
-            "回退率": f"{reading.fallback_rate:.4f}",
-            "采集时间": collected_at,
-        }, status="已结算", pending=False)
+        from app.services import SERVICES
+
+        # 1) 管线内隔离事实落库，作为闭合证据可打开的真实隔离凭据
+        engine_quarantined = self.quarantine.get_quarantined(batch_id)
+        existing_quarantine = {
+            (str(r.get("关联批次")), str(r.get("原始行号")))
+            for r in store.rows("row_quarantine")
+        }
+        for qr in engine_quarantined:
+            key = (batch_id, str(qr.row_num))
+            if key in existing_quarantine:
+                continue
+            _append_row("row_quarantine", {
+                "隔离编号": f"RQ-{batch_id}-{qr.row_num}",
+                "关联批次": batch_id,
+                "原始行号": str(qr.row_num),
+                "失败字段": ",".join(qr.failed_fields),
+                "失败原因": "、".join(qr.reasons),
+                "原始行文本": qr.raw_text,
+                "复核结论": "",
+                "隔离时间": collected_at,
+            }, status="已隔离", pending=True)
+        quarantined_rows = len(engine_quarantined)
+
+        # 2) 保证渠道/投递批次可被事实来源按原过滤口径找到
+        if not any(
+            r.get("批次编号") == batch_id
+            for r in store.rows("file_intake")
+        ):
+            _append_row("file_intake", {
+                "批次编号": batch_id, "来源渠道": channel,
+                "原始文件名": f"{batch_id}.dat", "字节大小": "0",
+                "投递时间": collected_at, "文件后缀": ".dat",
+                "声明格式": "csv", "接收节点": "node-01",
+            }, status="已入库", pending=False)
+
+        # 3) 发布完成证明 → 可核对的闭合凭据（重复发布沿用同一凭据，只算一笔）
+        batch_svc = SERVICES["parse_batch"]
+        ok_proof, proof_msg, _proof = batch_svc.ensure_close_proof(
+            intake_batch=batch_id, close_time=collected_at,
+            total_rows=total_rows,
+            success_rows=max(0, total_rows - quarantined_rows),
+            quarantine_rows=quarantined_rows)
+        self._log(link, "close_proof", "ok" if ok_proof else f"FAIL:{proof_msg}")
+
+        # 4) 与手工入口读同一份已闭合批次事实，重算读数并封存快照
+        metric_svc = SERVICES["parse_metric"]
+        _ok, settle_msg, _row, facts = metric_svc.settle_pipeline_reading(
+            reading_no=reading_id, window=window, channel=channel,
+            collected_at=collected_at,
+            parse_durations_ms=parse_durations_ms or None)
+        quarantine_rate = facts.quarantine_rate
         self._log(link, "metric_collect",
+                  f"closed={facts.closed_batch_count} "
                   f"quarantine_rate={quarantine_rate:.4f} "
-                  f"fallback_rate={reading.fallback_rate:.4f}")
+                  f"fallback_rate={facts.fallback_rate:.4f} {settle_msg}")
         return {"link": link, "ok": True,
-                "reading": reading.to_dict(),
-                "quarantined_rows": quarantined_rows,
+                "reading": {
+                    "reading_id": reading_id,
+                    "window": window,
+                    "channel": channel,
+                    "throughput_rows": facts.throughput_rows,
+                    "avg_parse_ms": facts.avg_parse_ms,
+                    "quarantine_rate": quarantine_rate,
+                    "fallback_rate": facts.fallback_rate,
+                    "collected_at": collected_at,
+                    "status": "已结算",
+                },
+                "closed_batch_count": facts.closed_batch_count,
+                "close_credentials": facts.close_credentials,
+                "quarantined_rows": facts.quarantined_rows,
                 "quarantine_rate": quarantine_rate,
-                "fallback_decisions": fallback_decisions,
-                "total_decisions": total_decisions}
+                "fallback_decisions": facts.fallback_decisions,
+                "total_decisions": facts.total_decisions,
+                "conflicts": facts.conflicts,
+                "needs_review": facts.needs_review}
 
     # ------------------------------------------------------------------
     # 链路10：首选解析器失败→备选回退→字段解析/路由失败

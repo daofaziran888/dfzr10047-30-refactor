@@ -1515,7 +1515,7 @@ class TestLink8WatermarkCoverage:
 
 class TestLink9MetricSettle:
     def test_rates_come_from_real_counts(self, fresh_store):
-        """隔离率来自坏行隔离真实计数，回退率来自解析路由真实回退。"""
+        """管线结算与手工结算读同一事实来源：闭合凭据、隔离率、回退率来自真实计数。"""
         orch = ParsePipelineOrchestrator()
         # 造 2 条隔离 + 1 次回退的真实计数
         rows = clean_rows(10)
@@ -1535,12 +1535,41 @@ class TestLink9MetricSettle:
             reading_id="PM-T9A", window="20260904", channel="sftp-node-03",
             batch_id="FI-M001", total_rows=10,
             parse_durations_ms=[2.0, 4.0], collected_at="2026-09-05T00:00:00")
-        assert result["quarantined_rows"] == 2
-        assert result["quarantine_rate"] == pytest.approx(0.2)
-        assert result["fallback_decisions"] == 1
+        # 管线完成证明已发布为可核对闭合凭据，FI-M001 与 seed 里已闭合的 PB-001 同范围
+        assert "CC-FI-M001" in result["close_credentials"]
+        assert "CC-FI-20260901001" in result["close_credentials"]
+        assert result["closed_batch_count"] == 2
+        # 吞吐/隔离分子分母来自同一组闭合批次：500(PB-001) + 10(FI-M001)
+        assert result["reading"]["throughput_rows"] == 510
+        # 隔离行：PB-001 两笔 + FI-M001 两笔，均为逐批事实
+        assert result["quarantined_rows"] == 4
+        # 舍入口径不变：round(x, 4)
+        assert result["quarantine_rate"] == pytest.approx(round(4 / 510, 4))
         readings = intake_rows("parse_metric", **{"指标读数编号": "PM-T9A"})
-        assert readings[0]["隔离率"] == "0.2000"
+        assert readings[0]["隔离率"] == f"{round(4 / 510, 4):.4f}"
         assert readings[0]["status"] == "已结算"
+        # 管线耗时均值沿用原口径：显式序列均值
+        assert readings[0]["平均解析耗时"] == "3.00"
+        # 读数封存的快照可重开完整结算范围
+        metric_svc = SERVICES["parse_metric"]
+        evidence = metric_svc.reading_evidence("PM-T9A")
+        assert {e["intake_batch"] for e in evidence["closed_batches"]} == {
+            "FI-20260901001", "FI-M001"}
+        ok, msg = metric_svc.cross_check("PM-T9A")
+        assert ok is True
+
+    def test_pipeline_and_manual_share_same_fact_source(self, fresh_store):
+        """两个入口对同一渠道读到的闭合范围与计数完全一致。"""
+        orch = ParsePipelineOrchestrator()
+        orch.link9_metric_settle(
+            reading_id="PM-PIPE", window="20260904", channel="sftp-node-03",
+            batch_id="FI-M100", total_rows=7, parse_durations_ms=[1.0],
+            collected_at="2026-09-05T00:00:00")
+        manual_facts = SERVICES["parse_metric"].channel_facts("sftp-node-03")
+        pipe_evidence = SERVICES["parse_metric"].reading_evidence("PM-PIPE")
+        assert pipe_evidence["close_credentials"] == manual_facts.close_credentials
+        assert pipe_evidence["throughput_rows"] == manual_facts.throughput_rows
+        assert pipe_evidence["total_rows"] == manual_facts.total_rows
 
     def test_zero_rows_yields_zero_rate(self, fresh_store):
         orch = ParsePipelineOrchestrator()
@@ -1550,6 +1579,9 @@ class TestLink9MetricSettle:
             collected_at="2026-09-05T00:00:00")
         assert result["quarantine_rate"] == 0.0
         assert result["reading"]["avg_parse_ms"] == 0.0
+        # 零行批次完成证明仍登记，闭合范围里有 1 批但吞吐为 0，零分母归零
+        assert result["closed_batch_count"] == 1
+        assert result["reading"]["throughput_rows"] == 0
 
 
 class TestLink10RouteFallback:
@@ -2167,12 +2199,17 @@ class TestParseMetricService:
             "PM-T1", "20260903", "sftp-node-03", "2026-09-04T00:00:00")
         assert ok is True
         assert reading["status"] == "已结算"
-        # seed: sftp-node-03 有 FI-20260901001(PB-001: 500行) 与 FI-20260902002(PB-002: 800行)
-        # 隔离行: RQ-001(FI-20260901001), RQ-003/RQ-005(FI-20260902002) → 3 条
+        # 重构后事实来源只认已闭合批次：sftp-node-03 仅 PB-001(FI-20260901001, 500行)
+        # 已闭合；PB-002(FI-20260902002) 仍在途，其隔离行不得计入。
         rate, quarantined, total = svc.real_quarantine_rate("sftp-node-03")
-        assert quarantined == 4
-        assert total == 1300
-        assert rate == pytest.approx(4 / 1300, abs=1e-4)
+        assert quarantined == 2
+        assert total == 500
+        assert rate == pytest.approx(2 / 500, abs=1e-4)
+        # 读数封存的闭合范围可逐笔打开
+        evidence = svc.reading_evidence("PM-T1")
+        assert evidence["closed_batch_count"] == 1
+        assert evidence["close_credentials"] == ["CC-FI-20260901001"]
+        assert evidence["throughput_rows"] == 500
 
     def test_cross_check_detects_mismatch(self, fresh_store):
         svc = SERVICES["parse_metric"]
@@ -2192,11 +2229,92 @@ class TestParseMetricService:
 
     def test_fallback_rate_from_route_decisions(self, fresh_store):
         svc = SERVICES["parse_metric"]
-        # seed: parser_route PR-002 回退1次(已回退), PR-003 回退3次(路由失败)，都在 sftp-node-03/api-gateway-01
+        # 回退决策同样只取闭合批次：sftp-node-03 当前仅 FI-20260901001 闭合，
+        # 其路由 PR-001 回退次数为 0；在途批次 PR-004 不计入分母。
         rate, fallbacks, total = svc.real_fallback_rate("sftp-node-03")
-        assert total >= 2
-        assert fallbacks >= 1
-        assert rate > 0
+        assert total == 1
+        assert fallbacks == 0
+        assert rate == 0.0
+
+    def test_closed_batches_only_after_more_close(self, fresh_store):
+        """在途批次闭合后再结算，新读数纳入新范围，旧读数保留旧分母。"""
+        svc = SERVICES["parse_metric"]
+        svc.settle_reading("PM-OLD", "20260903", "sftp-node-03", "t1")
+        old_evidence = svc.reading_evidence("PM-OLD")
+        assert old_evidence["closed_batch_count"] == 1
+        assert old_evidence["total_rows"] == 500
+
+        # 复核掉 PB-002 的隔离行并闭合 A 组之外的在途批次
+        for row in store.rows("row_quarantine"):
+            if row["关联批次"] == "FI-20260902002":
+                row["status"] = "已回补"
+        for i in range(5):
+            store.rows("field_parse").append({
+                "id": 810 + i, "status": "解析成功", "pending": False, "abnormal": False,
+                "解析编号": f"FP-Y{i}", "关联批次": "FI-20260902002",
+                "命中模板": "ET-002", "字段名称": "rec_id",
+                "原始取值": "x", "解析取值": "x", "解析耗时": "1",
+                "解析行号": str(i + 1)})
+        SERVICES["parse_batch"].close_batch(
+            "FI-20260902002", "2026-09-04T00:00:00")
+
+        # 新读数范围扩大；闭合时按字段解析真实明细刷新计数（原行为），
+        # FI-20260902002 只有 5 条 field_parse，总行数由 800 刷新为 5。
+        svc.settle_reading("PM-NEW", "20260904", "sftp-node-03", "t2")
+        new_evidence = svc.reading_evidence("PM-NEW")
+        assert new_evidence["closed_batch_count"] == 2
+        assert new_evidence["total_rows"] == 505
+        # 旧读数分母与原窗口证据不被后来闭合的行覆盖
+        assert svc.reading_evidence("PM-OLD")["total_rows"] == 500
+        ok, _msg, comparison = svc.reconcile_live("PM-OLD")
+        assert ok is True
+        assert comparison["historical_preserved"] is True
+        assert comparison["new_credentials"] == ["CC-FI-20260902002"]
+
+    def test_duplicate_close_credential_counted_once(self, fresh_store):
+        """批次明细里重复的闭合凭据只采一次。"""
+        facts = SERVICES["parse_metric"].channel_facts("sftp-node-03")
+        assert facts.closed_batch_count == 1
+        # 再上报一份同凭据的闭合证明
+        store.rows("parse_batch").append({
+            "id": 910, "status": "已闭合", "pending": False, "abnormal": False,
+            "批次记录编号": "PB-DUP1", "关联投递批次": "FI-20260901001",
+            "解析器标识": "csv_parser_v2", "总行数": "500", "成功行数": "498",
+            "隔离行数": "2", "批次状态": "已闭合",
+            "闭合凭据": "CC-FI-20260901001", "完成时间": "2026-09-05T00:00:00"})
+        facts2 = SERVICES["parse_metric"].channel_facts("sftp-node-03")
+        assert facts2.closed_batch_count == 1
+        assert facts2.throughput_rows == 500
+        assert len(facts2.duplicate_credentials) == 1
+        assert facts2.needs_review is False
+
+    def test_delivered_count_conflict_marks_review_but_keeps_result(self, fresh_store):
+        """交付闭合数与逐批事实冲突 → 待复核，服务端结果与完整范围仍可查询。"""
+        ok, msg, reading = SERVICES["parse_metric"].settle_reading(
+            "PM-CONF", "20260903", "sftp-node-03", "t",
+            delivered_close_count=3)
+        assert ok is True
+        assert reading["status"] == "待复核"
+        assert reading["abnormal"] is True
+        # 服务端按逐批事实算出的结果仍在
+        assert reading["解析吞吐行数"] == "500"
+        evidence = SERVICES["parse_metric"].reading_evidence("PM-CONF")
+        assert evidence["needs_review"] is True
+        assert any("冲突" in c for c in evidence["conflicts"])
+        # 仍可按原结果核对、重开完整结算范围
+        ok2, _msg2 = SERVICES["parse_metric"].cross_check("PM-CONF")
+        assert ok2 is True
+        assert evidence["close_credentials"] == ["CC-FI-20260901001"]
+
+    def test_zero_denominator_and_rounding_unchanged(self, fresh_store):
+        """无闭合批次渠道：零分母归零，舍入口径不变。"""
+        ok, _msg, reading = SERVICES["parse_metric"].settle_reading(
+            "PM-ZERO", "20260903", "no-such-channel", "t")
+        assert ok is True
+        assert reading["隔离率"] == "0.0000"
+        assert reading["回退率"] == "0.0000"
+        assert reading["平均解析耗时"] == "0.00"
+        assert reading["解析吞吐行数"] == "0"
 
 
 class TestUnitNormalizeService:
@@ -2507,3 +2625,189 @@ class TestIntakeAuditAndServices:
         assert audits[-1]["变更后值"] == "探测格式xlsx"
         snap = audit_svc.domain_snapshot()
         assert snap["count"] >= 6
+
+
+# ======================================================================
+# 重构验收叙事：A1 六行 / A2 四行 → 手工结算 → A3 两行管线结算
+# 两个入口共用同一已闭合批次事实来源，覆盖去重、冲突、历史快照与证据核对
+# ======================================================================
+class TestSettlementFactSourceNarrative:
+    CHANNEL = "narrative-channel"
+
+    def _intake(self, batch_id: str, ident: int) -> None:
+        store.rows("file_intake").append({
+            "id": 700 + ident, "status": "已入库", "pending": False,
+            "abnormal": False, "批次编号": batch_id, "来源渠道": self.CHANNEL,
+            "原始文件名": f"{batch_id}.csv", "字节大小": "1024",
+            "投递时间": "2026-09-10T08:00:00", "文件后缀": ".csv",
+            "声明格式": "csv", "接收节点": "node-01"})
+
+    def _close_proof(self, ident: int, batch_id: str, total: int,
+                     quarantine: int, credential: str | None = None) -> None:
+        store.rows("parse_batch").append({
+            "id": 710 + ident, "status": "已闭合", "pending": False,
+            "abnormal": False, "批次记录编号": f"PB-{batch_id}",
+            "关联投递批次": batch_id, "解析器标识": "csv_parser_v2",
+            "总行数": str(total), "成功行数": str(total - quarantine),
+            "隔离行数": str(quarantine), "批次状态": "已闭合",
+            "闭合凭据": credential or f"CC-{batch_id}",
+            "完成时间": "2026-09-10T09:00:00"})
+
+    def _quarantine(self, ident: int, batch_id: str, row_num: int) -> None:
+        store.rows("row_quarantine").append({
+            "id": 720 + ident, "status": "已废弃", "pending": False,
+            "abnormal": True, "隔离编号": f"RQ-{batch_id}-{row_num}",
+            "关联批次": batch_id, "原始行号": str(row_num),
+            "失败字段": "data_value", "失败原因": "JSONL行解析失败",
+            "原始行文本": "broken", "复核结论": "源数据丢失",
+            "隔离时间": "2026-09-10T08:30:00"})
+
+    def _seed_a1_a2(self) -> None:
+        # A1 六行（含 1 行隔离）、A2 四行（无隔离）
+        self._intake("FI-A1", 1)
+        self._intake("FI-A2", 2)
+        self._close_proof(1, "FI-A1", 6, 1)
+        self._close_proof(2, "FI-A2", 4, 0)
+        self._quarantine(1, "FI-A1", 3)
+
+    def test_manual_settlement_then_pipeline_a3_and_history(self, fresh_store):
+        metric_svc = SERVICES["parse_metric"]
+        batch_svc = SERVICES["parse_batch"]
+        self._seed_a1_a2()
+
+        # —— 第一次手工读数：只看到 A1/A2 两份闭合事实 ——
+        facts = metric_svc.channel_facts(self.CHANNEL)
+        assert facts.closed_batch_count == 2
+        assert facts.throughput_rows == 10
+        assert facts.quarantined_rows == 1
+        assert facts.quarantine_rate == pytest.approx(round(1 / 10, 4))
+        ok, _msg, reading = metric_svc.settle_reading(
+            "PM-MANUAL-1", "20260910", self.CHANNEL, "2026-09-10T10:00:00")
+        assert ok is True
+        assert reading["已闭合批次数"] == "2"
+        assert reading["批次总行计数"] == "10"
+        assert reading["隔离行计数"] == "1"
+
+        # —— 手工复核在途时，管线为 A3（两行）发布第三份完成证明并触发管线读数 ——
+        self._intake("FI-A3", 3)
+        ok, proof_msg, proof = batch_svc.ensure_close_proof(
+            "FI-A3", "2026-09-10T11:00:00", total_rows=2,
+            success_rows=2, quarantine_rows=0, parser="csv_parser_v2")
+        assert ok is True
+        assert proof["闭合凭据"] == "CC-FI-A3"
+        # 管线重复发布同一完成证明：沿用同一凭据，不新增闭合计数
+        ok2, _msg2, proof2 = batch_svc.ensure_close_proof(
+            "FI-A3", "2026-09-10T11:05:00", total_rows=2,
+            success_rows=2, quarantine_rows=0)
+        assert ok2 is True
+        assert proof2["闭合凭据"] == "CC-FI-A3"
+
+        # 管线入口与手工入口读同一事实来源，一起重算
+        ok3, _msg3, pipe_reading, pipe_facts = metric_svc.settle_pipeline_reading(
+            "PM-PIPE-1", "20260910", self.CHANNEL, "2026-09-10T12:00:00",
+            parse_durations_ms=[3.0, 5.0])
+        assert ok3 is True
+        assert pipe_facts.closed_batch_count == 3
+        assert pipe_reading["解析吞吐行数"] == "12"
+        assert pipe_reading["平均解析耗时"] == "4.00"
+        # 两个入口同一时刻对同一渠道的事实完全一致
+        manual_facts = metric_svc.channel_facts(self.CHANNEL)
+        assert manual_facts.close_credentials == pipe_facts.close_credentials
+        assert manual_facts.throughput_rows == pipe_facts.throughput_rows
+
+        # —— 中断后打开旧读数：历史分母与原窗口证据仍是 A1/A2 的 10 行 ——
+        old_evidence = metric_svc.reading_evidence("PM-MANUAL-1")
+        assert old_evidence["closed_batch_count"] == 2
+        assert old_evidence["total_rows"] == 10
+        assert set(old_evidence["close_credentials"]) == {"CC-FI-A1", "CC-FI-A2"}
+        ok4, _msg4, comparison = metric_svc.reconcile_live("PM-MANUAL-1")
+        assert ok4 is True
+        assert comparison["historical_preserved"] is True
+        assert comparison["new_credentials"] == ["CC-FI-A3"]
+        assert comparison["snapshot_denominator"] == 10
+        assert comparison["live_denominator"] == 12
+
+        # —— 复核员从同一读数打开每笔真实闭合证据 ——
+        batches = {e["intake_batch"]: e for e in old_evidence["closed_batches"]}
+        assert set(batches) == {"FI-A1", "FI-A2"}
+        assert batches["FI-A1"]["close_credential"] == "CC-FI-A1"
+        assert batches["FI-A1"]["quarantine_credentials"] == ["RQ-FI-A1-3"]
+        assert batches["FI-A1"]["total_rows"] == 6
+        ok5, cross_msg = metric_svc.cross_check("PM-MANUAL-1")
+        assert ok5 is True
+        assert "CC-FI-A1" in cross_msg
+
+    def test_duplicate_credential_in_batch_detail_counted_once(self, fresh_store):
+        metric_svc = SERVICES["parse_metric"]
+        self._seed_a1_a2()
+        # 批次明细里再登记一条 A1 的重复闭合证明：同凭据、同投递批次
+        store.rows("parse_batch").append({
+            "id": 719, "status": "已闭合", "pending": False,
+            "abnormal": False, "批次记录编号": "PB-FI-A1-DUP",
+            "关联投递批次": "FI-A1", "解析器标识": "csv_parser_v2",
+            "总行数": "6", "成功行数": "5", "隔离行数": "1",
+            "批次状态": "已闭合", "闭合凭据": "CC-FI-A1",
+            "完成时间": "2026-09-10T09:30:00"})
+
+        facts = metric_svc.channel_facts(self.CHANNEL)
+        # 重复闭合只算一笔：仍是 A1/A2 两批、10 行
+        assert facts.closed_batch_count == 2
+        assert facts.throughput_rows == 10
+        assert len(facts.duplicate_credentials) == 1
+        assert facts.duplicate_credentials[0]["闭合凭据"] == "CC-FI-A1"
+        # 纯重复不升级待复核，界面按服务端结果继续核对
+        assert facts.needs_review is False
+        ok, _msg, reading = metric_svc.settle_reading(
+            "PM-DUP", "20260910", self.CHANNEL, "t")
+        assert reading["status"] == "已结算"
+        # 仍能重开原先的完整结算范围
+        evidence = metric_svc.reading_evidence("PM-DUP")
+        assert sorted(evidence["close_credentials"]) == ["CC-FI-A1", "CC-FI-A2"]
+
+    def test_conflicting_delivered_count_marks_review_keeps_scope(self, fresh_store):
+        metric_svc = SERVICES["parse_metric"]
+        self._seed_a1_a2()
+        # 外部交付声称闭合了 5 批，但逐批事实只有 2 批
+        ok, _msg, reading = metric_svc.settle_reading(
+            "PM-CONFLICT", "20260910", self.CHANNEL, "t",
+            delivered_close_count=5)
+        assert ok is True
+        assert reading["status"] == "待复核"
+        assert reading["pending"] is True
+        # 界面按服务端结果继续核对：服务端逐批事实结果原样保留
+        assert reading["解析吞吐行数"] == "10"
+        assert reading["已闭合批次数"] == "2"
+        evidence = metric_svc.reading_evidence("PM-CONFLICT")
+        assert evidence["needs_review"] is True
+        assert any("交付闭合数 5" in c for c in evidence["conflicts"])
+        # 仍能重开原先的完整结算范围并通过内部一致性核对
+        ok2, _msg2 = metric_svc.cross_check("PM-CONFLICT")
+        assert ok2 is True
+        assert len(evidence["closed_batches"]) == 2
+
+    def test_same_reading_numerators_share_one_batch_scope(self, fresh_store):
+        """同一读数的吞吐、隔离分子/分母、回退分子/分母来自同一组闭合批次。"""
+        metric_svc = SERVICES["parse_metric"]
+        self._seed_a1_a2()
+        # 给在途的 A3 也挂一条路由决策，但 A3 未闭合，绝不能进入任何分子分母
+        self._intake("FI-A3", 3)
+        store.rows("parser_route").append({
+            "id": 730, "status": "已回退", "pending": False, "abnormal": True,
+            "决策编号": "PR-A3", "关联批次": "FI-A3", "推断格式": "csv-utf8",
+            "命中解析器": "csv_parser_v1", "备选解析器": "", "路由依据": "回退",
+            "回退次数": "2", "决策时间": "t"})
+        # 闭合批次 A1 上一条无回退决策
+        store.rows("parser_route").append({
+            "id": 731, "status": "已选定", "pending": False, "abnormal": False,
+            "决策编号": "PR-A1", "关联批次": "FI-A1", "推断格式": "csv-utf8",
+            "命中解析器": "csv_parser_v2", "备选解析器": "", "路由依据": "首选",
+            "回退次数": "0", "决策时间": "t"})
+
+        facts = metric_svc.channel_facts(self.CHANNEL)
+        # 分母只含闭合的 A1/A2；A3 的回退决策被隔离在外
+        assert facts.closed_batch_count == 2
+        assert facts.total_decisions == 1
+        assert facts.fallback_decisions == 0
+        assert facts.fallback_rate == 0.0
+        assert facts.throughput_rows == facts.total_rows == 10
+        assert facts.quarantined_rows == 1

@@ -103,9 +103,12 @@ class RowQuarantineService(BaseModuleService):
                 batch["成功行数"] = str(int(success) + 1 if success.isdigit() else 1)
                 batch["隔离行数"] = str(
                     max(0, int(quarantined) - 1) if quarantined.isdigit() else 0)
-                if batch.get("隔离行数") == "0":
+                if batch["隔离行数"] == "0":
                     batch["批次状态"] = "已闭合"
                     batch["status"] = "已闭合"
+                    # 回补导致的闭合同样签发闭合凭据，保证事实来源逐笔可核对
+                    batch["闭合凭据"] = str(batch.get("闭合凭据") or "").strip() or (
+                        f"CC-{batch_no}")
                     batch["pending"] = False
                     batch["abnormal"] = False
                 break

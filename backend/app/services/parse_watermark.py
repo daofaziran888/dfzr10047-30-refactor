@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.facts import is_closed_batch
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -26,11 +27,14 @@ class ParseWatermarkService(BaseModuleService):
         return None
 
     def unclosed_batches(self, channel: str) -> list[str]:
-        """列出该来源渠道下尚未闭合的投递批次编号。"""
+        """列出该来源渠道下尚未闭合的投递批次编号。
+
+        闭合判定收口到共享事实来源（app.facts），与指标结算的已闭合批次计数同源。
+        """
         closed_positions = {
             r.get("关联投递批次")
             for r in store.rows("parse_batch")
-            if r.get("批次状态") in ("闭合", "已闭合")
+            if is_closed_batch(r)
         }
         unclosed: list[str] = []
         for row in store.rows("file_intake"):
@@ -45,7 +49,7 @@ class ParseWatermarkService(BaseModuleService):
             parse_row = next(
                 (r for r in store.rows("parse_batch")
                  if r.get("关联投递批次") == batch_no), None)
-            if parse_row is None or parse_row.get("批次状态") not in ("闭合", "已闭合"):
+            if parse_row is None or not is_closed_batch(parse_row):
                 unclosed.append(batch_no)
         return sorted(set(unclosed))
 
